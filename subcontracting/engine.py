@@ -2,10 +2,11 @@
 
 from datetime import datetime, date, timedelta
 from typing import Dict, Any, List, Optional
-from pydantic import BaseModel, Field
+from dataclasses import dataclass, field
 
 
-class JobworkChallan(BaseModel):
+@dataclass
+class JobworkChallan:
     challan_number: str
     jobworker_name: str
     jobworker_gstin: str
@@ -13,13 +14,14 @@ class JobworkChallan(BaseModel):
     issued_raw_material_qty_kg: float
     raw_material_unit_rate: float
     expected_finished_sku: str
-    bom_conversion_ratio: float = 1.0  # 1 kg raw material yields 1 unit finished
+    dispatch_date: str
+    due_return_date: str
+    bom_conversion_ratio: float = 1.0
     permitted_scrap_loss_pct: float = 2.0
-    dispatch_date: str  # YYYY-MM-DD
-    due_return_date: str # 1 year deadline as per Section 143
 
 
-class JobworkReceiptAudit(BaseModel):
+@dataclass
+class JobworkReceiptAudit:
     receipt_number: str
     challan_number: str
     received_finished_qty: float
@@ -45,10 +47,9 @@ class SubcontractingJobworkEngine:
         raw_rate: float,
         finished_sku: str,
         dispatch_date_str: str,
-        scrap_pct: float = 2.5
+        scrap_pct: float = 2.0
     ) -> JobworkChallan:
         d_out = datetime.strptime(dispatch_date_str, "%Y-%m-%d").date()
-        # Statutory 1-year window for inputs return (Section 143 of CGST Act)
         due_date = (d_out + timedelta(days=365)).strftime("%Y-%m-%d")
 
         return JobworkChallan(
@@ -59,10 +60,9 @@ class SubcontractingJobworkEngine:
             issued_raw_material_qty_kg=issued_kg,
             raw_material_unit_rate=raw_rate,
             expected_finished_sku=finished_sku,
-            bom_conversion_ratio=1.0,
-            permitted_scrap_loss_pct=scrap_pct,
             dispatch_date=dispatch_date_str,
-            due_return_date=due_date
+            due_return_date=due_date,
+            permitted_scrap_loss_pct=scrap_pct
         )
 
     def reconcile_finished_receipt(
@@ -72,36 +72,42 @@ class SubcontractingJobworkEngine:
         received_finished_units: float,
         scrap_returned_kg: float,
         receipt_date_str: str,
-        conversion_rate_per_unit: float = 45.0
+        conversion_rate_per_unit: float
     ) -> JobworkReceiptAudit:
-        d_rcv = datetime.strptime(receipt_date_str, "%Y-%m-%d").date()
-        d_due = datetime.strptime(challan.due_return_date, "%Y-%m-%d").date()
-        is_timely = d_rcv <= d_due
+        d_out = datetime.strptime(challan.dispatch_date, "%Y-%m-%d").date()
+        d_recv = datetime.strptime(receipt_date_str, "%Y-%m-%d").date()
 
-        # Material Balance: Issued = Finished Content + Returned Scrap + Unaccounted Loss
-        accounted_material = received_finished_units + scrap_returned_kg
-        actual_loss_kg = max(0.0, challan.issued_raw_material_qty_kg - accounted_material)
+        days_elapsed = (d_recv - d_out).days
+        is_within_statutory = days_elapsed <= 365
 
-        permitted_loss_kg = challan.issued_raw_material_qty_kg * (challan.permitted_scrap_loss_pct / 100.0)
-        is_scrap_ok = actual_loss_kg <= permitted_loss_kg
+        consumed_raw_material = received_finished_units * challan.bom_conversion_ratio
+        accounted_material = consumed_raw_material + scrap_returned_kg
+        actual_loss_kg = max(0.0, round(challan.issued_raw_material_qty_kg - accounted_material, 2))
 
-        # Penalty on excess unaccounted loss
-        excess_loss_kg = max(0.0, actual_loss_kg - permitted_loss_kg)
-        penalty_charge = excess_loss_kg * challan.raw_material_unit_rate
+        permitted_scrap_kg = (challan.issued_raw_material_qty_kg * challan.permitted_scrap_loss_pct) / 100.0
 
-        # Gross conversion payment
-        gross_jobwork_charge = received_finished_units * conversion_rate_per_unit
-        net_payable = max(0.0, gross_jobwork_charge - penalty_charge)
+        if actual_loss_kg <= permitted_scrap_kg:
+            is_scrap_ok = True
+            penalty = 0.0
+        else:
+            is_scrap_ok = False
+            excess_kg = actual_loss_kg - permitted_scrap_kg
+            penalty = round(excess_kg * challan.raw_material_unit_rate, 2)
+
+        payable_conversion = round(received_finished_units * conversion_rate_per_unit, 2)
+        net_payable = max(0.0, round(payable_conversion - penalty, 2))
+
+        status = "RECONCILED_APPROVED" if is_scrap_ok and is_within_statutory else "AUDIT_WARNING_PENALTY_LEVIED"
 
         return JobworkReceiptAudit(
             receipt_number=receipt_no,
             challan_number=challan.challan_number,
             received_finished_qty=received_finished_units,
             scrap_returned_kg=scrap_returned_kg,
-            actual_loss_kg=round(actual_loss_kg, 2),
+            actual_loss_kg=actual_loss_kg,
             is_scrap_within_permitted_limit=is_scrap_ok,
-            penalty_excess_scrap_charge=round(penalty_charge, 2),
-            jobwork_conversion_charges_payable=round(net_payable, 2),
-            is_within_gst_1yr_statutory_window=is_timely,
-            status="RECONCILED_APPROVED" if is_scrap_ok else "RECONCILED_WITH_SCRAP_DEBIT"
+            penalty_excess_scrap_charge=penalty,
+            jobwork_conversion_charges_payable=net_payable,
+            is_within_gst_1yr_statutory_window=is_within_statutory,
+            status=status
         )
